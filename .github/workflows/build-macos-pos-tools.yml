@@ -21,9 +21,11 @@ jobs:
           - arch: arm64
             runner: macos-15
             reth_asset: reth-v1.11.1-aarch64-apple-darwin.tar.gz
+            lighthouse_asset: lighthouse-v8.1.1-aarch64-apple-darwin.tar.gz
           - arch: x86_64
             runner: macos-15-intel
             reth_asset: reth-v1.11.1-x86_64-apple-darwin.tar.gz
+            lighthouse_asset: ""
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -50,7 +52,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25.7"
+          go-version: "1.26.0"
           cache: false
 
       - name: Prepare directories
@@ -81,20 +83,37 @@ jobs:
           set -euxo pipefail
           GOBIN="$RUNNER_TEMP/dist" go install "github.com/wealdtech/ethereal/v2@$ETHEREAL_VERSION"
 
-      - name: Install official Reth binary for matching architecture
+      - name: Install official Reth binary
         shell: bash
         run: |
           set -euxo pipefail
           cd "$RUNNER_TEMP"
-          curl -fL --retry 3             -o reth.tar.gz             "https://github.com/paradigmxyz/reth/releases/download/$RETH_VERSION/${{ matrix.reth_asset }}"
-          mkdir -p reth-unpack
+          curl -fL --retry 3 -o reth.tar.gz             "https://github.com/paradigmxyz/reth/releases/download/$RETH_VERSION/${{ matrix.reth_asset }}"
+          rm -rf reth-unpack
+          mkdir reth-unpack
           tar -xzf reth.tar.gz -C reth-unpack
           RETH_BIN="$(find reth-unpack -type f -name reth -perm -111 | head -1)"
           test -n "$RETH_BIN"
           cp "$RETH_BIN" "$RUNNER_TEMP/dist/reth"
           chmod +x "$RUNNER_TEMP/dist/reth"
 
-      - name: Build Lighthouse v8.1.1 natively
+      - name: Install official Lighthouse binary on Apple Silicon
+        if: matrix.arch == 'arm64'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 3 -o lighthouse.tar.gz             "https://github.com/sigp/lighthouse/releases/download/$LIGHTHOUSE_VERSION/${{ matrix.lighthouse_asset }}"
+          rm -rf lighthouse-unpack
+          mkdir lighthouse-unpack
+          tar -xzf lighthouse.tar.gz -C lighthouse-unpack
+          LH_BIN="$(find lighthouse-unpack -type f -name lighthouse -perm -111 | head -1)"
+          test -n "$LH_BIN"
+          cp "$LH_BIN" "$RUNNER_TEMP/dist/lighthouse"
+          chmod +x "$RUNNER_TEMP/dist/lighthouse"
+
+      - name: Build Lighthouse v8.1.1 on Intel Mac
+        if: matrix.arch == 'x86_64'
         shell: bash
         run: |
           set -euxo pipefail
@@ -120,12 +139,10 @@ jobs:
           ./ethereal version
           ./eth2-val-tools --help >/dev/null
 
-          # Verify local mnemonic generation without printing the mnemonic.
           MNEMONIC="$(./eth2-val-tools mnemonic)"
           WORDS="$(printf '%s\n' "$MNEMONIC" | wc -w | tr -d '[:space:]')"
           test "$WORDS" = "24"
 
-          # Verify the exact 0x02 deposit-data path needed by the hands-on.
           ./eth2-val-tools deposit-data             --validators-mnemonic="$MNEMONIC"             --withdrawal-address=0x1111111111111111111111111111111111111111             --source-min=0             --source-max=1             --fork-version=0x42424242             --amount=32000000000             --withdrawal-credentials-type=0x02             > "$RUNNER_TEMP/deposit-data.jsonl"
 
           python3 - "$RUNNER_TEMP/deposit-data.jsonl" <<'PY'
@@ -151,13 +168,12 @@ jobs:
             echo "runner=${{ matrix.runner }}"
             echo "requested_arch=${{ matrix.arch }}"
             echo "uname_m=$(uname -m)"
-            echo "reth=$RETH_VERSION (official upstream release binary)"
-            echo "lighthouse=$LIGHTHOUSE_VERSION (built from source)"
-            echo "ethdo=$ETHDO_VERSION (built from source)"
-            echo "ethereal=$ETHEREAL_VERSION (built from source)"
-            echo "eth2_val_tools_ref=$ETH2_VAL_TOOLS_REF (built from source)"
+            echo "reth=$RETH_VERSION"
+            echo "lighthouse=$LIGHTHOUSE_VERSION"
+            echo "ethdo=$ETHDO_VERSION"
+            echo "ethereal=$ETHEREAL_VERSION"
+            echo "eth2_val_tools_ref=$ETH2_VAL_TOOLS_REF"
           } > BUILD_INFO.txt
-
           shasum -a 256 reth lighthouse eth2-val-tools ethdo ethereal > SHA256SUMS.txt
           file reth lighthouse eth2-val-tools ethdo ethereal > ARCHITECTURES.txt
 
