@@ -1,0 +1,177 @@
+name: Build UZH PoS macOS tools
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/macos-dual-arch-2026-10-06
+    paths:
+      - ".github/workflows/build-macos-pos-tools.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            reth_asset: reth-v1.11.1-aarch64-apple-darwin.tar.gz
+          - arch: x86_64
+            runner: macos-15-intel
+            reth_asset: reth-v1.11.1-x86_64-apple-darwin.tar.gz
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+
+    env:
+      RETH_VERSION: "v1.11.1"
+      LIGHTHOUSE_VERSION: "v8.1.1"
+      ETHDO_VERSION: "v1.39.0"
+      ETHEREAL_VERSION: "v2.12.0"
+      ETH2_VAL_TOOLS_REF: "4555a401e36a6a70242655c7122777ed3ba1320e"
+
+    steps:
+      - name: Checkout build harness
+        uses: actions/checkout@v5
+
+      - name: Show runner architecture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          uname -m
+          sw_vers
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.7"
+          cache: false
+
+      - name: Prepare directories
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/src" "$RUNNER_TEMP/dist"
+
+      - name: Build eth2-val-tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/src"
+          git clone https://github.com/protolambda/eth2-val-tools.git
+          cd eth2-val-tools
+          git checkout "$ETH2_VAL_TOOLS_REF"
+          go build -trimpath -o "$RUNNER_TEMP/dist/eth2-val-tools" .
+
+      - name: Build ethdo
+        shell: bash
+        run: |
+          set -euxo pipefail
+          GOBIN="$RUNNER_TEMP/dist" go install "github.com/wealdtech/ethdo@$ETHDO_VERSION"
+
+      - name: Build ethereal
+        shell: bash
+        run: |
+          set -euxo pipefail
+          GOBIN="$RUNNER_TEMP/dist" go install "github.com/wealdtech/ethereal/v2@$ETHEREAL_VERSION"
+
+      - name: Install official Reth binary for matching architecture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 3             -o reth.tar.gz             "https://github.com/paradigmxyz/reth/releases/download/$RETH_VERSION/${{ matrix.reth_asset }}"
+          mkdir -p reth-unpack
+          tar -xzf reth.tar.gz -C reth-unpack
+          RETH_BIN="$(find reth-unpack -type f -name reth -perm -111 | head -1)"
+          test -n "$RETH_BIN"
+          cp "$RETH_BIN" "$RUNNER_TEMP/dist/reth"
+          chmod +x "$RUNNER_TEMP/dist/reth"
+
+      - name: Build Lighthouse v8.1.1 natively
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/src"
+          git clone --depth 1 --branch "$LIGHTHOUSE_VERSION" https://github.com/sigp/lighthouse.git
+          cd lighthouse
+          rustup update stable
+          cargo install             --path lighthouse             --force             --locked             --features portable,gnosis             --profile maxperf             --root "$RUNNER_TEMP/lighthouse-install"
+          cp "$RUNNER_TEMP/lighthouse-install/bin/lighthouse" "$RUNNER_TEMP/dist/lighthouse"
+          chmod +x "$RUNNER_TEMP/dist/lighthouse"
+
+      - name: Smoke-test binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/dist"
+
+          file reth lighthouse eth2-val-tools ethdo ethereal
+
+          ./reth --version
+          ./lighthouse --version
+          ./ethdo version
+          ./ethereal version
+          ./eth2-val-tools --help >/dev/null
+
+          # Verify local mnemonic generation without printing the mnemonic.
+          MNEMONIC="$(./eth2-val-tools mnemonic)"
+          WORDS="$(printf '%s\n' "$MNEMONIC" | wc -w | tr -d '[:space:]')"
+          test "$WORDS" = "24"
+
+          # Verify the exact 0x02 deposit-data path needed by the hands-on.
+          ./eth2-val-tools deposit-data             --validators-mnemonic="$MNEMONIC"             --withdrawal-address=0x1111111111111111111111111111111111111111             --source-min=0             --source-max=1             --fork-version=0x42424242             --amount=32000000000             --withdrawal-credentials-type=0x02             > "$RUNNER_TEMP/deposit-data.jsonl"
+
+          python3 - "$RUNNER_TEMP/deposit-data.jsonl" <<'PY'
+          import json, sys
+          rows = [json.loads(x) for x in open(sys.argv[1]) if x.strip()]
+          assert len(rows) == 1, rows
+          wc = rows[0]["withdrawal_credentials"]
+          wc = wc[2:] if wc.startswith("0x") else wc
+          assert len(wc) == 64, wc
+          assert wc.startswith("02"), wc
+          print("0x02 deposit-data smoke test: PASS")
+          PY
+
+          unset MNEMONIC
+
+      - name: Write build manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/dist"
+          {
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner=${{ matrix.runner }}"
+            echo "requested_arch=${{ matrix.arch }}"
+            echo "uname_m=$(uname -m)"
+            echo "reth=$RETH_VERSION (official upstream release binary)"
+            echo "lighthouse=$LIGHTHOUSE_VERSION (built from source)"
+            echo "ethdo=$ETHDO_VERSION (built from source)"
+            echo "ethereal=$ETHEREAL_VERSION (built from source)"
+            echo "eth2_val_tools_ref=$ETH2_VAL_TOOLS_REF (built from source)"
+          } > BUILD_INFO.txt
+
+          shasum -a 256 reth lighthouse eth2-val-tools ethdo ethereal > SHA256SUMS.txt
+          file reth lighthouse eth2-val-tools ethdo ethereal > ARCHITECTURES.txt
+
+      - name: Create bundle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP"
+          tar -czf "uzh-pos-tools-macos-${{ matrix.arch }}.tar.gz" -C dist             reth lighthouse eth2-val-tools ethdo ethereal             BUILD_INFO.txt SHA256SUMS.txt ARCHITECTURES.txt
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: uzh-pos-tools-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/uzh-pos-tools-macos-${{ matrix.arch }}.tar.gz
+          compression-level: 0
+          retention-days: 7
