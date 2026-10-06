@@ -1,0 +1,143 @@
+name: Clean UZH PoS Linux student package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/macos-dual-arch-2026-10-06
+    paths:
+      - ".github/workflows/clean-linux-student-package.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  clean-linux:
+    name: Clean Linux vm_pos package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      SOURCE_URL: "https://gitlab.uzh.ch/syedmuhammad.yasir/uzh-eth-pos/-/raw/main/electra/vm_pos_linux.tar"
+      RELEASE_TAG: "vm-pos-linux-clean-2026-10-06"
+
+    steps:
+      - name: Download current Linux package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fL --retry 4 --retry-delay 2 -o "$RUNNER_TEMP/vm_pos_linux_input.tar" "$SOURCE_URL"
+          test -s "$RUNNER_TEMP/vm_pos_linux_input.tar"
+
+      - name: Extract and remove macOS metadata
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/pkg"
+          tar -xf "$RUNNER_TEMP/vm_pos_linux_input.tar" -C "$RUNNER_TEMP/pkg" || true
+          test -d "$RUNNER_TEMP/pkg/vm_pos"
+
+          VM="$RUNNER_TEMP/pkg/vm_pos"
+
+          find "$VM" -name '.DS_Store' -delete || true
+          find "$VM" -name '._*' -delete || true
+          find "$VM" -type d -name '__MACOSX' -prune -exec rm -rf {} + || true
+
+          # Strip any copied extended attributes if present.
+          if command -v setfattr >/dev/null 2>&1; then
+            find "$VM" -type f -exec setfattr --remove-all {} + 2>/dev/null || true
+            find "$VM" -type d -exec setfattr --remove-all {} + 2>/dev/null || true
+          fi
+
+      - name: Audit package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          VM="$RUNNER_TEMP/pkg/vm_pos"
+
+          required=(
+            genesis.json consensus/config.yaml activate_exes.sh
+            geth_bootnodes.txt beacon_bootnodes.txt
+            0_genesis_init.sh 1_geth_launch.sh 2_beacon_launch.sh 3_validator_launch.sh
+            ip_test.sh set_ext_ip.sh set_wallet_address.sh snapshot_sync.sh
+            validator_cfg/generate_mnemonic.sh
+            validator_cfg/0_prompt_user.sh
+            validator_cfg/1_generate_val_keys.sh
+            validator_cfg/2_arrange_keys.sh
+            validator_cfg/3_deposit_config_SOURCE_THIS.sh
+            validator_cfg/4_build_deposit.sh
+            validator_cfg/5_make_deposits.sh
+            validator_cfg/keygen.env
+          )
+
+          for f in "${required[@]}"; do
+            test -e "$VM/$f" || { echo "MISSING: $f" >&2; exit 1; }
+          done
+
+          while IFS= read -r -d '' f; do
+            bash -n "$f"
+          done < <(find "$VM" -type f -name '*.sh' -print0)
+
+          grep -Eq '^export mnemonic=""$' "$VM/validator_cfg/keygen.env"
+          grep -Eq '^export funding_wallet=""$' "$VM/validator_cfg/keygen.env"
+          grep -Eq '^export funding_wallet_private_key=""$' "$VM/validator_cfg/keygen.env"
+          grep -Eq '^export withdrawal_address=""$' "$VM/validator_cfg/keygen.env"
+          grep -Eq '^export deposit_amount_eth="32"$' "$VM/validator_cfg/keygen.env"
+
+          grep -q 'eth2-val-tools mnemonic' "$VM/validator_cfg/generate_mnemonic.sh"
+          ! grep -q 'Enter your mnemonic' "$VM/validator_cfg/0_prompt_user.sh"
+          grep -q 'withdrawal-credentials-type=0x02' "$VM/validator_cfg/4_build_deposit.sh"
+
+          if find "$VM" \( -name '.DS_Store' -o -name '._*' -o -name 'deposit_log.txt' -o -name 'validator_mnemonic.txt' -o -name '*.bak.*' \) -print | grep -q .; then
+            echo "ERROR: junk/runtime artifact remains" >&2
+            find "$VM" \( -name '.DS_Store' -o -name '._*' -o -name 'deposit_log.txt' -o -name 'validator_mnemonic.txt' -o -name '*.bak.*' \) -print >&2
+            exit 1
+          fi
+
+          chmod 600 "$VM/validator_cfg/keygen.env"
+
+          echo "Linux package structural/safety audit: PASS"
+
+      - name: Repack clean tar
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$RUNNER_TEMP/pkg"
+          tar --format=ustar --no-xattrs --no-acls --no-selinux -cf "$RUNNER_TEMP/vm_pos_linux.tar" vm_pos
+          test -s "$RUNNER_TEMP/vm_pos_linux.tar"
+          sha256sum "$RUNNER_TEMP/vm_pos_linux.tar" | tee "$RUNNER_TEMP/vm_pos_linux.tar.sha256"
+          tar -tf "$RUNNER_TEMP/vm_pos_linux.tar" | grep -E '/\._|\.DS_Store|__MACOSX' && exit 1 || true
+          ls -lh "$RUNNER_TEMP/vm_pos_linux.tar"
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm_pos_linux_clean
+          path: |
+            ${{ runner.temp }}/vm_pos_linux.tar
+            ${{ runner.temp }}/vm_pos_linux.tar.sha256
+          compression-level: 0
+          retention-days: 7
+
+      - name: Publish direct-download GitHub release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "UZH PoS Linux student package — clean 2026-10-06" \
+              --notes "Clean Linux/WSL vm_pos package with macOS AppleDouble/.DS_Store/xattr metadata removed and student workflow audited."
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            "$RUNNER_TEMP/vm_pos_linux.tar" \
+            "$RUNNER_TEMP/vm_pos_linux.tar.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+          echo "Direct package URL:"
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/vm_pos_linux.tar"
