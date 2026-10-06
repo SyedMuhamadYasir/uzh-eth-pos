@@ -1,0 +1,182 @@
+name: Assemble UZH PoS Intel student package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/macos-dual-arch-2026-10-06
+    paths:
+      - ".github/workflows/assemble-intel-student-package.yml"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  assemble-intel-package:
+    name: Assemble complete macOS Intel vm_pos package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      SOURCE_RUN_ID: "37437768489"
+      MAC_TEMPLATE_URL: "https://gitlab.uzh.ch/syedmuhammad.yasir/uzh-eth-pos/-/raw/main/electra/vm_pos_mac.zip"
+      RELEASE_TAG: "vm-pos-intel-2026-10-06"
+
+    steps:
+      - name: Download already-tested Intel tool bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: uzh-pos-tools-macos-x86_64
+          path: ${{ runner.temp }}/intel-artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Extract Intel executables
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/intel-tools"
+          BUNDLE="$(find "$RUNNER_TEMP/intel-artifact" -maxdepth 2 -type f -name 'uzh-pos-tools-macos-x86_64.tar.gz' -print -quit)"
+          test -n "$BUNDLE"
+          tar -xzf "$BUNDLE" -C "$RUNNER_TEMP/intel-tools"
+          for f in reth lighthouse eth2-val-tools ethdo ethereal; do
+            test -x "$RUNNER_TEMP/intel-tools/$f"
+          done
+          echo "Intel bundle extracted successfully."
+          file "$RUNNER_TEMP/intel-tools"/{reth,lighthouse,eth2-val-tools,ethdo,ethereal}
+
+      - name: Download tested Apple-Silicon student package as template
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fL --retry 4 --retry-delay 2 -o "$RUNNER_TEMP/vm_pos_mac.zip" "$MAC_TEMPLATE_URL"
+          rm -rf "$RUNNER_TEMP/template"
+          mkdir -p "$RUNNER_TEMP/template"
+          unzip -q "$RUNNER_TEMP/vm_pos_mac.zip" -d "$RUNNER_TEMP/template"
+          test -d "$RUNNER_TEMP/template/vm_pos"
+          echo "Template package downloaded and extracted."
+
+      - name: Replace only architecture-specific executables
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          VM="$RUNNER_TEMP/template/vm_pos"
+          BIN="$VM/precompiled_exes"
+          test -d "$BIN"
+
+          for f in reth lighthouse eth2-val-tools ethdo ethereal; do
+            install -m 0755 "$RUNNER_TEMP/intel-tools/$f" "$BIN/$f"
+          done
+
+          # Keep the known-working package semantics unchanged; only replace
+          # the five architecture-specific executables above.
+          find "$VM" -name '.DS_Store' -delete || true
+          find "$VM" -name '._*' -delete || true
+          find "$VM" -type d -name '__MACOSX' -prune -exec rm -rf {} + || true
+
+          chmod 600 "$VM/validator_cfg/keygen.env"
+
+          echo "Architecture check:"
+          file "$BIN"/{reth,lighthouse,eth2-val-tools,ethdo,ethereal}
+          for f in reth lighthouse eth2-val-tools ethdo ethereal; do
+            file "$BIN/$f" | grep -Eq 'x86_64|x86-64' || {
+              echo "ERROR: $f is not x86_64" >&2
+              exit 1
+            }
+          done
+
+      - name: Structural and safety audit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          VM="$RUNNER_TEMP/template/vm_pos"
+
+          required=(
+            genesis.json consensus/config.yaml activate_exes.sh
+            0_genesis_init.sh 1_geth_launch.sh 2_beacon_launch.sh 3_validator_launch.sh
+            ip_test.sh set_ext_ip.sh set_wallet_address.sh snapshot_sync.sh
+            validator_cfg/generate_mnemonic.sh
+            validator_cfg/0_prompt_user.sh
+            validator_cfg/1_generate_val_keys.sh
+            validator_cfg/2_arrange_keys.sh
+            validator_cfg/3_deposit_config_SOURCE_THIS.sh
+            validator_cfg/4_build_deposit.sh
+            validator_cfg/5_make_deposits.sh
+            validator_cfg/keygen.env
+          )
+          for f in "${required[@]}"; do
+            test -e "$VM/$f" || { echo "MISSING: $f" >&2; exit 1; }
+          done
+
+          # All shell files must at least parse under bash.
+          while IFS= read -r -d '' f; do
+            bash -n "$f"
+          done < <(find "$VM" -type f -name '*.sh' -print0)
+
+          # Clean student template: no populated validator secrets.
+          grep -Eq '^export mnemonic=""$' "$VM/validator_cfg/keygen.env"
+          grep -Eq '^export funding_wallet=""$' "$VM/validator_cfg/keygen.env"
+          grep -Eq '^export funding_wallet_private_key=""$' "$VM/validator_cfg/keygen.env"
+          grep -Eq '^export withdrawal_address=""$' "$VM/validator_cfg/keygen.env"
+          grep -Eq '^export deposit_amount_eth="32"$' "$VM/validator_cfg/keygen.env"
+
+          # 2026 workflow semantics expected by the hands-on.
+          grep -q 'eth2-val-tools mnemonic' "$VM/validator_cfg/generate_mnemonic.sh"
+          ! grep -q 'Enter your mnemonic' "$VM/validator_cfg/0_prompt_user.sh"
+          grep -q 'withdrawal-credentials-type=0x02' "$VM/validator_cfg/4_build_deposit.sh"
+
+          # Release must not contain runtime/student artifacts.
+          if find "$VM" \( -name 'deposit_log.txt' -o -name 'validator_mnemonic.txt' -o -name '*.bak.*' \) -print | grep -q .; then
+            echo "ERROR: runtime/test artifact found in package" >&2
+            find "$VM" \( -name 'deposit_log.txt' -o -name 'validator_mnemonic.txt' -o -name '*.bak.*' \) -print >&2
+            exit 1
+          fi
+
+          echo "Structural and secret-sanitization audit: PASS"
+
+      - name: Package full Intel student archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$RUNNER_TEMP/template"
+          rm -f "$RUNNER_TEMP/vm_pos_intel.zip"
+          zip -qry "$RUNNER_TEMP/vm_pos_intel.zip" vm_pos \
+            -x '*/.DS_Store' '*/._*' '__MACOSX/*' '*/__MACOSX/*'
+          test -s "$RUNNER_TEMP/vm_pos_intel.zip"
+          sha256sum "$RUNNER_TEMP/vm_pos_intel.zip" | tee "$RUNNER_TEMP/vm_pos_intel.zip.sha256"
+          unzip -l "$RUNNER_TEMP/vm_pos_intel.zip" | tail -5
+          ls -lh "$RUNNER_TEMP/vm_pos_intel.zip"
+
+      - name: Upload complete Intel package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm_pos_intel_complete
+          path: |
+            ${{ runner.temp }}/vm_pos_intel.zip
+            ${{ runner.temp }}/vm_pos_intel.zip.sha256
+          compression-level: 0
+          retention-days: 7
+
+      - name: Publish direct-download GitHub release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "UZH PoS macOS Intel student package — 2026-10-06" \
+              --notes "Complete Intel macOS vm_pos student package. Built from the tested Apple-Silicon student package with only the five bundled client/tool executables replaced by the already smoke-tested native x86_64 builds from Actions run 37437768489."
+          fi
+          gh release upload "$RELEASE_TAG" \
+            "$RUNNER_TEMP/vm_pos_intel.zip" \
+            "$RUNNER_TEMP/vm_pos_intel.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+          echo "Direct package URL:"
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/vm_pos_intel.zip"
